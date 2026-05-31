@@ -36,7 +36,7 @@ VALID_WEEKDAYS = {1, 2, 3}       # Tue=1, Wed=2, Thu=3
 SESSION_START  = (2, 0)           # 02:00 NY
 SESSION_END    = (11, 0)          # 11:00 NY
 
-MAX_SL_PIPS     = 30.0   # $30 hard cap for XAUUSD
+SL_PCT          = 0.01   # SL = 1% of entry price (fixed rule, no swing hunting)
 MIN_RR          = 2.0             # hard rule: 1:2 minimum
 MAX_TRADES_WEEK = 3               # 3 ideas per week max
 MAX_WEEKLY_LOSS = 0.03
@@ -62,7 +62,7 @@ TRADE_FIELDS = [
     "setup_quality", "confluence_score",
     "ttps_htf", "ttps_entry", "ttps_session", "ttps_risk", "ttps_total",
     "primary_fvg_tf", "primary_fvg_bottom", "primary_fvg_top",
-    "swept_level", "risk_amount",
+    "swept_level", "risk_amount", "risk_multiplier",
     "week_number", "block_reason",
 ]
 
@@ -140,6 +140,7 @@ class Trade:
     primary_fvg_top:    float
     swept_level:     float | None
     risk_amount:     float
+    risk_multiplier: float
     block_reason:    str
 
 
@@ -151,10 +152,45 @@ class WeekState:
     weekly_pnl:    float = 0.0
     start_balance: float = 0.0
     kill_active:   bool  = False
+    # Risk scaling state — tracks wins/losses in sequence this week
+    weekly_wins:   int   = 0      # closed wins so far this week
+    weekly_losses: int   = 0      # closed losses so far this week
 
     def __post_init__(self):
         if self.days_traded is None:
             self.days_traded = set()
+
+    def risk_multiplier(self) -> float:
+        """
+        Weekly dynamic risk scaling rule:
+
+        Trade 1 (first of week):      always full risk (1.0x)
+
+        Trade 2:
+          If Trade 1 was a WIN  → half risk (0.5x) — protect profits
+          If Trade 1 was a LOSS → full risk (1.0x) — no change, try to recover
+
+        Trade 3:
+          If Trade 1 WIN  → already at half risk, stay at half (0.5x)
+          If 2 consecutive losses so far → half risk (0.5x) — protect account
+          Otherwise → full risk (1.0x)
+
+        Logic in plain English:
+          - First win of the week cuts all remaining risk in half (protect profits)
+          - Two consecutive losses cut risk in half (stop the bleeding)
+          - All other cases = full risk
+        """
+        closed = self.weekly_wins + self.weekly_losses
+        if closed == 0:
+            return 1.0   # Trade 1 — always full
+
+        if self.weekly_wins >= 1:
+            return 0.5   # Won at least once this week → protect profits
+
+        if self.weekly_losses >= 2:
+            return 0.5   # Two consecutive losses → cut risk
+
+        return 1.0       # 1 loss, no wins yet → stay full
 
 
 @dataclass
@@ -546,6 +582,35 @@ def choose_htf_area(
         return None
     return sorted(candidates, key=lambda x: (x[0], x[1]), reverse=True)[0][2]
 
+def recent_price_leg(candles: list[Candle], lookback: int = 20) -> tuple[float, float, float]:
+    """
+    Get the high, low, and 50% midpoint of the recent price leg.
+    Used to determine if an FVG sits in premium or discount.
+    """
+    recent = candles[-lookback:] if len(candles) >= lookback else candles
+    high = max(c.high for c in recent)
+    low  = min(c.low  for c in recent)
+    mid  = (high + low) / 2
+    return high, low, mid
+
+
+def fvg_in_optimal_zone(
+    fvg: DetectedFVG,
+    bias: str,
+    leg_high: float,
+    leg_low: float,
+    leg_mid: float,
+) -> bool:
+    """
+    Returns True if FVG sits in the optimal zone for the bias:
+      BULLISH → FVG should be in discount (below 50% of recent leg)
+      BEARISH → FVG should be in premium (above 50% of recent leg)
+    """
+    fvg_center = (fvg.top + fvg.bottom) / 2
+    if bias == "BULLISH":
+        return fvg_center <= leg_mid   # discount zone
+    else:
+        return fvg_center >= leg_mid   # premium zone
 
 def find_entry_fvg(
     history: dict[str, list[Candle]],
@@ -554,18 +619,12 @@ def find_entry_fvg(
     bias: str,
     current_price: float,
     htf_area: DetectedFVG | None,
+    h1: list[Candle],
+    h4: list[Candle],
 ) -> DetectedFVG | None:
-    """
-    Layer 2 — Find the H1 or H4 entry FVG.
+    # Get recent price leg for premium/discount scoring
+    leg_high, leg_low, leg_mid = recent_price_leg(h4[-20:] if h4 else h1[-80:])
 
-    ICT entry model:
-      - Scan H4 then H1 FVGs in bias direction
-      - Price must be inside or have just entered the FVG
-      - If an HTF area exists, prefer FVGs inside it (but don't require it)
-      - Most recently formed FVG that price is currently touching = entry
-
-    This is the actual entry zone where we place the trade.
-    """
     entry_candidates = []
 
     for tf, weight in (("H4", 3), ("H1", 2)):
@@ -573,29 +632,39 @@ def find_entry_fvg(
             if fvg.direction != bias:
                 continue
             formed = parse_time(fvg.formed_time)
-            # Look back 14 days (2 weeks) for H4, 3 days for H1
-            lookback_days = 14 if tf == "H4" else 3
-            if formed < as_of - timedelta(days=lookback_days):
+            if formed < as_of - timedelta(days=14):
                 continue
             if not fvg_still_valid(fvg, history[tf], tf, as_of):
                 continue
-            # Price must be inside the FVG (hard rule from rules doc)
-            # Using $10 tolerance for XAUUSD spread and wick precision
             if not fvg.overlaps_price(current_price, tolerance=10.0):
                 continue
 
-            # Bonus if this entry FVG sits inside the HTF area of interest
+            # Premium/discount bonus — notes say highest probability
+            # FVG is one that sits in optimal zone for the bias
+            zone_bonus = 1 if fvg_in_optimal_zone(
+                fvg, bias, leg_high, leg_low, leg_mid
+            ) else 0
+
+            # HTF confluence bonus
             htf_bonus = 0
             if htf_area is not None:
                 overlap = (
-                   max(fvg.bottom, htf_area.bottom)
-                   <=
-                   min(fvg.top, htf_area.top)
+                    max(fvg.bottom, htf_area.bottom)-
+                    min(fvg.top, htf_area.top)
                 )
                 if overlap:
                     htf_bonus = 2
 
-            entry_candidates.append((weight + htf_bonus, formed, fvg))
+            # Current week FVG bonus — notes specifically mention
+            # FVGs formed this week are valid and important
+            week_bonus = 0
+            days_old = (as_of - formed).days
+            if days_old <= 7:
+                week_bonus = 1
+
+            entry_candidates.append(
+                (weight + htf_bonus + zone_bonus + week_bonus, formed, fvg)
+            )
 
     if not entry_candidates:
         return None
@@ -607,46 +676,74 @@ def find_entry_fvg(
 def detect_liquidity_sweep(
     h1: list[Candle],
     bias: str,
+    d1: list[Candle] | None = None,
 ) -> tuple[bool, float | None]:
     """
-    Sweep detection across three lookback windows:
-      1. Previous session    — last 12 H1 candles (~half a day)
-      2. Previous day        — last 24 H1 candles
-      3. Previous week       — last 120 H1 candles (5 trading days)
+    ICT liquidity sweep against named levels as per strategy notes:
+      1. Equal highs/lows (within 0.15% tolerance)
+      2. Previous day high/low
+      3. Previous week high/low (using last 5 trading days of H1)
 
-    A sweep is confirmed when:
-      - Price wicks through the lowest low (BULLISH) or highest high (BEARISH)
-        within the window
-      - The candle that swept CLOSES back on the other side (MSS confirmation)
+    For BULLISH: sweep on sell side (SSL) — price wicks below level, closes above
+    For BEARISH: sweep on buy side  (BSL) — price wicks above level, closes below
 
-    Prefers the most recent sweep found — closest in time = most relevant.
+    Returns (swept, swept_level_price)
     """
-    if len(h1) < 13:
+    if len(h1) < 5:
         return False, None
 
     latest    = h1[-1]
-    tolerance = 2.0   # $2 tolerance for XAUUSD
+    tolerance = 2.0  # $2 tolerance for XAUUSD
 
-    # Define windows: (label, prior_candles)
-    windows = [
-        h1[-13:-1],   # previous session (~12 candles)
-        h1[-25:-1],   # previous day (~24 candles)
-        h1[-121:-1],  # previous week (~120 candles)
-    ]
+    # ── Build named sweep levels ──────────────────────────────────────────
 
-    for prior in windows:
-        if not prior:
-            continue
+    levels: list[float] = []
 
-        if bias == "BULLISH":
-            # Looking for SSL sweep: wick below the window's lowest low
-            level = min(c.low for c in prior)
-            if latest.low <= (level + tolerance) and latest.close > level:
+    # 1. Previous day high/low — last 24 H1 candles = 1 day
+    if len(h1) >= 25:
+        prev_day = h1[-25:-1]
+        levels.append(min(c.low  for c in prev_day))  # prev day low  = SSL
+        levels.append(max(c.high for c in prev_day))  # prev day high = BSL
+
+    # 2. Previous week high/low — last 120 H1 candles = 5 trading days
+    if len(h1) >= 121:
+        prev_week = h1[-121:-1]
+        levels.append(min(c.low  for c in prev_week))  # weekly low  = SSL
+        levels.append(max(c.high for c in prev_week))  # weekly high = BSL
+
+    # 3. Equal highs/lows from H1 swings
+    all_highs, all_lows = detect_swings(h1[-120:])
+    eq_tol = 0.0015  # 0.15% tolerance for equal levels
+
+    for i in range(len(all_highs)):
+        for j in range(i + 1, len(all_highs)):
+            a, b = all_highs[i].price, all_highs[j].price
+            avg  = (a + b) / 2
+            if avg > 0 and abs(a - b) / avg <= eq_tol:
+                levels.append(avg)  # equal high = BSL
+
+    for i in range(len(all_lows)):
+        for j in range(i + 1, len(all_lows)):
+            a, b = all_lows[i].price, all_lows[j].price
+            avg  = (a + b) / 2
+            if avg > 0 and abs(a - b) / avg <= eq_tol:
+                levels.append(avg)  # equal low = SSL
+
+    # ── Check each level for sweep ────────────────────────────────────────
+
+    if bias == "BULLISH":
+        # SSL sweep: wick below level, close above (sell stops taken, reversal up)
+        ssl_levels = [l for l in levels if l < latest.close]
+        for level in sorted(ssl_levels, reverse=True):  # closest first
+            swept = latest.low <= (level + tolerance) and latest.close > level
+            if swept:
                 return True, level
-        else:
-            # Looking for BSL sweep: wick above the window's highest high
-            level = max(c.high for c in prior)
-            if latest.high >= (level - tolerance) and latest.close < level:
+    else:
+        # BSL sweep: wick above level, close below (buy stops taken, reversal down)
+        bsl_levels = [l for l in levels if l > latest.close]
+        for level in sorted(bsl_levels):  # closest first
+            swept = latest.high >= (level - tolerance) and latest.close < level
+            if swept:
                 return True, level
 
     return False, None
@@ -660,54 +757,16 @@ def find_sl_price(
     entry_fvg: DetectedFVG | None = None,
 ) -> tuple[float | None, float]:
     """
-    SL always placed at a swing point relevant to the bias direction.
-    No minimum pip rule — SL goes wherever the structure says.
-    Hard maximum: $30 (MAX_SL_PIPS) to keep risk controlled.
-
-    Priority:
-      1. Most recent H1 swing low (BULLISH) or swing high (BEARISH)
-         that is below/above entry and within $30
-      2. FVG zone edge as fallback if no clean swing found
+    SL = 1% of entry price, placed directly below (BULLISH) or above (BEARISH).
+    Simple, consistent, immune to noisy small swing points.
+    e.g. entry = $2000 → SL distance = $20, sl at $1980 (long) or $2020 (short).
     """
-    MAX_SL = MAX_SL_PIPS  # $30 hard cap
-
-    highs, lows = detect_swings(h1[-100:])
-
+    sl_distance = round(entry * SL_PCT, 2)
     if bias == "BULLISH":
-        # SL below the most recent swing low that is below entry
-        candidates = [
-            sw for sw in reversed(lows)
-            if sw.price < entry and (entry - sw.price) <= MAX_SL
-        ]
-        if candidates:
-            sl = candidates[0].price - 1.0  # $1 buffer below swing low
-            return sl, abs(entry - sl)
-
-        # Fallback: FVG bottom - buffer
-        if entry_fvg is not None:
-            sl = entry_fvg.bottom - 1.0
-            dist = abs(entry - sl)
-            if dist <= MAX_SL:
-                return sl, dist
-
-    else:  # BEARISH
-        # SL above the most recent swing high that is above entry
-        candidates = [
-            sw for sw in reversed(highs)
-            if sw.price > entry and (sw.price - entry) <= MAX_SL
-        ]
-        if candidates:
-            sl = candidates[0].price + 1.0  # $1 buffer above swing high
-            return sl, abs(entry - sl)
-
-        # Fallback: FVG top + buffer
-        if entry_fvg is not None:
-            sl = entry_fvg.top + 1.0
-            dist = abs(entry - sl)
-            if dist <= MAX_SL:
-                return sl, dist
-
-    return None, 0.0
+        sl = round(entry - sl_distance, 2)
+    else:
+        sl = round(entry + sl_distance, 2)
+    return sl, sl_distance
 
 
 def find_tp_price(
@@ -877,11 +936,21 @@ def calculate_ttps(
     elif 5 <= hour < 8:  session = 1   # NY morning
 
     # Dim 4: Risk Quality
+    # SL is always 1% of entry price — fixed. Score only on R:R quality.
     risk_score = 0
-    if sl_pips <= 25:    risk_score += 2
-    elif sl_pips <= 30:  risk_score += 1
-    if rr >= 2.5:        risk_score += 2
-    elif rr >= MIN_RR:   risk_score += 1
+    if rr >= 3.0:        risk_score += 3   # excellent target
+    elif rr >= 2.5:      risk_score += 2   # good target
+    elif rr >= MIN_RR:   risk_score += 1   # minimum acceptable
+    # +1 bonus if SL level is near an actual swing (structure alignment)
+    sl_price_calc = entry_price - sl_pips if bias == "BULLISH" else entry_price + sl_pips
+    highs_c, lows_c = detect_swings(h1[-50:])
+    sl_aligned = False
+    if bias == "BULLISH":
+        sl_aligned = any(abs(sw.price - sl_price_calc) <= 3.0 for sw in lows_c)
+    else:
+        sl_aligned = any(abs(sw.price - sl_price_calc) <= 3.0 for sw in highs_c)
+    if sl_aligned:
+        risk_score += 1
 
     total = htf + entry_score + session + risk_score
 
@@ -910,6 +979,33 @@ def open_filter_score(
     d_ok = (entry >= d1[-1].open) if bias == "BULLISH" else (entry <= d1[-1].open)
     return (1 if w_ok else 0) + (1 if d_ok else 0)
 
+def weekly_daily_open_bonus(
+    bias: str,
+    entry_price: float,
+    w1: list[Candle],
+    d1: list[Candle],
+) -> int:
+    """
+    Score 0-2 based on whether entry price is on the correct side
+    of the weekly open and daily open.
+    BULLISH: entry below weekly open (discount) = +1, below daily open = +1
+    BEARISH: entry above weekly open (premium)  = +1, above daily open = +1
+    Does NOT reject the trade if score = 0.
+    """
+    score = 0
+    if w1:
+        weekly_open = w1[-1].open
+        if bias == "BULLISH" and entry_price < weekly_open:
+            score += 1
+        elif bias == "BEARISH" and entry_price > weekly_open:
+            score += 1
+    if d1:
+        daily_open = d1[-1].open
+        if bias == "BULLISH" and entry_price < daily_open:
+            score += 1
+        elif bias == "BEARISH" and entry_price > daily_open:
+            score += 1
+    return score
 
 def find_signal(
     history: dict[str, list[Candle]],
@@ -965,7 +1061,7 @@ def find_signal(
     current_price = candle.close
 
     entry_fvg = find_entry_fvg(
-        history, fvg_cache, as_of, bias, current_price, htf_area
+        history, fvg_cache, as_of, bias, current_price, htf_area, h1, h4
     )
     if entry_fvg is None:
         return None
@@ -974,8 +1070,7 @@ def find_signal(
     sl_price, sl_pips = find_sl_price(bias, entry_price, h1, entry_fvg)
     if sl_price is None:
         return None
-    if sl_pips <= 0 or sl_pips > MAX_SL_PIPS:
-        return None
+    # SL is always 1% of entry — no range gate needed
 
     # ── Rule 5: Minimum 1:2 R:R ──────────────────────────────────────────
     tp_price, rr = find_tp_price(bias, entry_price, sl_price, d1, h4, h1)
@@ -989,11 +1084,11 @@ def find_signal(
         return None
 
     # ── Sweep detection (optional — score bonus only) ─────────────────────
-    swept, swept_level = detect_liquidity_sweep(h1, bias)
+    swept, swept_level = detect_liquidity_sweep(h1, bias, d1)
     sweep_bonus = 2 if swept else 0
 
     # ── Confluence score ──────────────────────────────────────────────────
-    open_score = open_filter_score(bias, entry_price, w1, d1)
+    open_score = weekly_daily_open_bonus(bias, entry_price, w1, d1)
     entry_tf_weight = 3 if entry_fvg.timeframe == "H4" else 2  # H4 > H1
     htf_bonus = 2 if htf_area is not None else 0
     score = open_score + entry_tf_weight + htf_bonus + sweep_bonus
@@ -1163,7 +1258,12 @@ def run_backtest(
         trade_day = candle.opened_ny.date()
 
         # ── Position sizing ───────────────────────────────────────────────
-        risk_amount = state.account_balance * risk_pct
+        # Apply weekly dynamic risk scaling:
+        #   Full risk (1.0x) for trade 1, and whenever no wins yet and < 2 losses
+        #   Half risk (0.5x) after first win of week (protect profits)
+        #   Half risk (0.5x) after two consecutive losses (protect account)
+        risk_multiplier = state.week.risk_multiplier()
+        risk_amount = state.account_balance * risk_pct * risk_multiplier
         lot_size    = math.floor(
             risk_amount / (signal.sl_pips * XAUUSD_PIP_VALUE_LOT) * 100
         ) / 100
@@ -1214,6 +1314,7 @@ def run_backtest(
             primary_fvg_top=signal.primary_fvg_top,
             swept_level=signal.swept_level,
             risk_amount=risk_amount,
+            risk_multiplier=risk_multiplier,
             block_reason=signal.block_reason,
         )
         trades.append(trade)
@@ -1224,13 +1325,19 @@ def run_backtest(
             state.week.weekly_pnl   += pnl
             state.week.trades_used  += 1
             state.week.days_traded.add(trade_day)
+            # Track wins/losses for dynamic risk scaling next trade
+            if result == "WIN":
+                state.week.weekly_wins  += 1
+            else:
+                state.week.weekly_losses += 1
 
             if check_weekly_kill(state):
                 state.week.kill_active = True
             if check_monthly_kill(state):
                 state.monthly_kill = True
         else:
-            # Open trade — still counts as used
+            # Open trade — still counts as used (risk_multiplier not updated
+            # because we don't know the result yet)
             state.week.trades_used += 1
             state.week.days_traded.add(trade_day)
 
@@ -1492,6 +1599,7 @@ def trade_to_row(t: Trade) -> dict[str, object]:
         "primary_fvg_top":   f"{t.primary_fvg_top:.2f}",
         "swept_level":       f"{t.swept_level:.2f}" if t.swept_level else "",
         "risk_amount":       f"{t.risk_amount:.2f}",
+        "risk_multiplier":   f"{t.risk_multiplier:.1f}",
         "week_number":       week_key(t.entry_time_utc),
         "block_reason":      t.block_reason,
     }
@@ -1615,7 +1723,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-

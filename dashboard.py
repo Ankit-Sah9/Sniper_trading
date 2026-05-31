@@ -125,7 +125,10 @@ def normalize_direction(value: str) -> str:
 
 
 def sl_pips(instrument: str, entry: float, sl: float) -> float:
-    pip = 0.1 if "XAU" in instrument.upper() or "GOLD" in instrument.upper() else 0.0001
+    # For XAUUSD: 1 pip = $1.00 price move (not 0.1).
+    # sl_pips here represents the raw $ distance — same unit used in backtest.
+    # For other forex pairs: 1 pip = 0.0001
+    pip = 1.0 if "XAU" in instrument.upper() or "GOLD" in instrument.upper() else 0.0001
     return abs(entry - sl) / pip if pip else 0.0
 
 
