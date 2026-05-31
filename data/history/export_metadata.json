@@ -1,0 +1,17 @@
+{
+  "exported_at_utc": "2026-05-30 14:21:32",
+  "ranges_years": {
+    "D1": 8,
+    "H1": 8,
+    "H4": 8,
+    "W1": 8
+  },
+  "requested_symbol": "XAUUSDm",
+  "rows": {
+    "D1": 2488,
+    "H1": 47451,
+    "H4": 12970,
+    "W1": 418
+  },
+  "selected_symbol": "XAUUSDm"
+}
