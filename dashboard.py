@@ -449,6 +449,21 @@ def render_dashboard_html() -> str:
     .badge.open {{ color: var(--amber); background: rgba(244, 191, 79, .12); }}
     canvas {{ width: 100%; height: 320px; background: #11161b; border: 1px solid var(--line); border-radius: 8px; }}
     .source {{ color: var(--muted); font-size: 12px; line-height: 1.6; }}
+    .btn {{
+      background: var(--blue);
+      border: none;
+      border-radius: 6px;
+      color: #101214;
+      padding: 8px 16px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: background 0.2s, transform 0.1s;
+    }}
+    .btn:hover {{ background: #82beff; }}
+    .btn:active {{ transform: scale(0.98); }}
     @media (max-width: 900px) {{ .grid-2 {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
@@ -481,6 +496,14 @@ def render_dashboard_html() -> str:
         <select id="resultFilter"><option value="">All results</option><option>Win</option><option>Loss</option><option>Open</option></select>
         <select id="directionFilter"><option value="">All directions</option><option>Long</option><option>Short</option></select>
         <select id="gradeFilter"><option value="">All grades</option></select>
+        <button id="downloadBtn" class="btn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+          Download CSV
+        </button>
       </div>
       <div class="table-wrap"><table id="tradeTable"></table></div>
     </section>
@@ -609,10 +632,39 @@ def render_dashboard_html() -> str:
       }});
     }}
 
+    function downloadCSV() {{
+      const trades = filteredTrades();
+      if (trades.length === 0) {{ alert("No trades to download."); return; }}
+      const headers = tradeColumns.map(([_, label]) => label);
+      const keys = tradeColumns.map(([key, _]) => key);
+      const csvRows = [];
+      csvRows.push(headers.map(h => `"${{h.replace(/"/g, '""')}}"`).join(","));
+      trades.forEach(trade => {{
+        const row = keys.map(key => {{
+          let val = trade[key];
+          if (val === null || val === undefined) val = "";
+          else val = String(val);
+          return `"${{val.replace(/"/g, '""')}}"`;
+        }});
+        csvRows.push(row.join(","));
+      }});
+      const csvString = csvRows.join("\\n");
+      const blob = new Blob([csvString], {{ type: "text/csv;charset=utf-8;" }});
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.setAttribute("href", url);
+      link.setAttribute("download", `trade_log_${{new Date().toISOString().slice(0, 10)}}.csv`);
+      link.style.visibility = 'hidden';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }}
+
     function init() {{
       const grades = [...new Set(DATA.trades.map(t => t.setup_quality).filter(Boolean))].sort();
       document.getElementById('gradeFilter').innerHTML += grades.map(g => `<option>${{g}}</option>`).join('');
       ['searchBox','resultFilter','directionFilter','gradeFilter'].forEach(id => document.getElementById(id).addEventListener('input', refreshTrades));
+      document.getElementById('downloadBtn').addEventListener('click', downloadCSV);
       refreshTrades();
       refreshWeekly();
       document.getElementById('sources').innerHTML = Object.entries(DATA.sources).map(([k,v]) => `<div>${{k}}: ${{v}}</div>`).join('');
