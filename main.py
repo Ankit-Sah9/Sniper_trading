@@ -561,19 +561,46 @@ def run_ttps() -> int:
 
 
 def run_backtest(mode: str = "full", start: str | None = None, end: str | None = None) -> int:
-    from backtest import main
+    from backtest import (
+        run_backtest as bt_run_backtest,
+        walk_forward,
+        parse_date,
+        print_data_status,
+        print_metrics,
+        TRADE_LOG_PATH as BT_TRADE_LOG_PATH,
+        FOLD_LOG_PATH,
+    )
 
-    original_argv = sys.argv
-    try:
-        new_argv = [original_argv[0], "--mode", mode]
-        if start:
-            new_argv += ["--start", start]
-        if end:
-            new_argv += ["--end", end]
-        sys.argv = new_argv
-        return main()
-    finally:
-        sys.argv = original_argv
+    print_data_status()
+    print()
+
+    if mode == "status":
+        return 0
+
+    if mode == "walk-forward":
+        rows = walk_forward()
+        if not rows:
+            return 1
+        print("\nWalk-Forward Validation Results")
+        print(f"  {'Fold':<8} {'Val Period':<24} {'Trades':>6} {'WR%':>6} "
+              f"{'PF':>5} {'TotalR':>7} {'DD%':>6}")
+        print("  " + "-" * 68)
+        for row in rows:
+            period = f"{row['validate_start']} → {row['validate_end']}"
+            print(f"  {row['fold']:<8} {period:<24} {row['trades']:>6} "
+                  f"{row['win_rate']:>6} {row['profit_factor']:>5} "
+                  f"{row['total_r']:>7} {row['max_drawdown_pct']:>6}%")
+        print(f"\n  Trade log:    {BT_TRADE_LOG_PATH}")
+        print(f"  Fold summary: {FOLD_LOG_PATH}")
+        return 0
+
+    # Full backtest
+    start_dt = parse_date(start) if start else None
+    end_dt   = parse_date(end)   if end   else None
+    trades   = bt_run_backtest(start=start_dt, end=end_dt)
+    print_metrics("Full Backtest", trades)
+    print(f"\n  Trade log: {BT_TRADE_LOG_PATH}")
+    return 0
 
 
 def run_controller() -> int:
