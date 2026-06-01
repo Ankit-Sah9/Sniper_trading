@@ -5,7 +5,7 @@ import csv
 import json
 import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -21,25 +21,28 @@ from FVGs import FVG as DetectedFVG
 from history import METADATA_PATH, history_path, load_env, trading_symbol
 
 
-PROJECT_ROOT   = Path(__file__).resolve().parent
-OUTPUT_DIR     = PROJECT_ROOT / "data" / "backtest"
+PROJECT_ROOT  = Path(__file__).resolve().parent
+OUTPUT_DIR    = PROJECT_ROOT / "data" / "backtest"
 TRADE_LOG_PATH = OUTPUT_DIR / "trade_log.csv"
 FOLD_LOG_PATH  = OUTPUT_DIR / "walk_forward_summary.csv"
 
 # ── Strategy constants ────────────────────────────────────────────────────────
+# XAUUSD: 1 pip = $1.00 price move
+# ── Strategy constants ────────────────────────────────────────────────────────
 XAUUSD_PIP_SIZE      = 1.0
 XAUUSD_PIP_VALUE_LOT = 1.0
 
-VALID_WEEKDAYS = {1, 2, 3}
-SESSION_START  = (2, 0)
-SESSION_END    = (12, 0)
+VALID_WEEKDAYS = {1, 2, 3}       # Tue=1, Wed=2, Thu=3
+SESSION_START  = (2, 0)           # 02:00 NY
+SESSION_END    = (11, 0)          # 11:00 NY
 
-SL_PCT          = 0.01
-MIN_RR          = 2.0
-MAX_TRADES_WEEK = 3
+MIN_SL_PIPS     = 10.0            # rules doc: SL can be short
+MAX_SL_PIPS     = 50.0            # wider for XAUUSD volatility
+MIN_RR          = 2.0             # hard rule: 1:2 minimum
+MAX_TRADES_WEEK = 3               # 3 ideas per week max
 MAX_WEEKLY_LOSS = 0.03
 MAX_MONTHLY_DD  = 0.10
-CPI_BUFFER_MINS = 10
+CPI_BUFFER_MINS = 10              # rules doc: 10 min after CPI
 
 TIMEFRAME_DURATIONS = {
     "W1": timedelta(days=7),
@@ -60,12 +63,8 @@ TRADE_FIELDS = [
     "setup_quality", "confluence_score",
     "ttps_htf", "ttps_entry", "ttps_session", "ttps_risk", "ttps_total",
     "primary_fvg_tf", "primary_fvg_bottom", "primary_fvg_top",
-    "swept_level", "risk_amount", "risk_multiplier",
+    "swept_level", "risk_amount",
     "week_number", "block_reason",
-    # New bias engine columns
-    "bias_trend_score", "bias_swing_score", "bias_zone_score",
-    "bias_po3_score", "bias_bull_total", "bias_bear_total",
-    "bias_conviction",
 ]
 
 
@@ -74,8 +73,8 @@ TRADE_FIELDS = [
 @dataclass(frozen=True)
 class Candle:
     time_str:  str
-    opened_at: datetime
-    opened_ny: datetime
+    opened_at: datetime       # UTC
+    opened_ny: datetime       # NY local
     open:  float
     high:  float
     low:   float
@@ -87,42 +86,13 @@ class Candle:
 class SwingPoint:
     time_str: str
     price:    float
-    kind:     str
-
-
-@dataclass(frozen=True)
-class BiasResult:
-    """
-    Output of the 4-variable bias engine.
-    Stores scores for each variable and the final bias + conviction.
-    """
-    # Variable 1 — Market Trend
-    trend_bull: int
-    trend_bear: int
-
-    # Variable 2 — Swing Point Respect
-    swing_bull: int
-    swing_bear: int
-
-    # Variable 3 — Premium / Discount Zone
-    zone_bull: int
-    zone_bear: int
-
-    # Variable 4 — Power of 3 (weekly)
-    po3_bull: int
-    po3_bear: int
-
-    # Final totals
-    bull_total: int
-    bear_total: int
-    final_bias: str       # "BULLISH", "BEARISH", "NO_TRADE"
-    conviction: str       # "HIGH", "MEDIUM", "LOW", "NONE"
+    kind:     str   # "HIGH" or "LOW"
 
 
 @dataclass(frozen=True)
 class Signal:
     direction:       str
-    entry_time:      datetime
+    entry_time:      datetime    # UTC
     entry_price:     float
     sl_price:        float
     tp_price:        float
@@ -140,7 +110,6 @@ class Signal:
     primary_fvg_top:    float
     swept_level:     float | None
     block_reason:    str
-    bias:            BiasResult | None = None
 
 
 @dataclass(frozen=True)
@@ -172,64 +141,73 @@ class Trade:
     primary_fvg_top:    float
     swept_level:     float | None
     risk_amount:     float
-    risk_multiplier: float
     block_reason:    str
-    bias:            BiasResult | None = None
 
 
 @dataclass
 class DayState:
-    date:          object
-    trades_today:  int = 0
-    last_result:   str = ""
-    wins_today:    int = 0
-    losses_today:  int = 0
+    """
+    Per-trading-day state. Resets at the start of each new calendar day (NY).
 
-    def may_trade(self) -> tuple[bool, str]:
-        if self.trades_today == 0:
+    Rules enforced here:
+    - Only 1 trade allowed per day to open (additional trade allowed only if
+      first trade of the day CLOSED in profit on the same day).
+    - A loss on this day blocks further same-day entries.
+    - A pending (OPEN) trade does NOT block the next day — it only matters
+      whether a trade CLOSED in loss on THIS day.
+    """
+    date:              object   # datetime.date in NY tz
+    trades_opened:     int   = 0   # how many trades were opened today
+    closed_loss_today: bool  = False  # True if any trade CLOSED as LOSS today
+
+    def may_open_trade(self) -> tuple[bool, str]:
+        """
+        Returns (allowed, reason).
+        First trade of the day: always allowed (no same-day closed loss).
+        Second trade: only allowed if first trade closed as WIN today.
+        """
+        if self.closed_loss_today:
+            return False, "Daily block: trade closed in loss today"
+        if self.trades_opened == 0:
             return True, ""
-        if self.last_result == "LOSS":
-            return False, "Daily block: last trade was a loss"
+        # trades_opened >= 1 but no closed loss — means at least one win
+        # already happened today; allow another entry
         return True, ""
 
-    def record(self, result: str) -> None:
-        self.trades_today += 1
-        self.last_result   = result
-        if result == "WIN":
-            self.wins_today += 1
-        elif result == "LOSS":
-            self.losses_today += 1
+    def record_open(self) -> None:
+        """Call when a trade is opened on this day."""
+        self.trades_opened += 1
+
+    def record_close(self, result: str) -> None:
+        """
+        Call when ANY trade closes (regardless of which day it was opened).
+        Only a LOSS close on this day triggers the daily block.
+        """
+        if result == "LOSS":
+            self.closed_loss_today = True
 
 
 @dataclass
 class WeekState:
+    """Resets every Sunday 18:00 NY."""
     trades_used:   int   = 0
-    days_traded:   set   = None
+    days_traded:   set   = None   # track which days traded
     weekly_pnl:    float = 0.0
     start_balance: float = 0.0
     kill_active:   bool  = False
-    weekly_wins:   int   = 0
-    weekly_losses: int   = 0
-    current_day:   DayState | None = None
+    # Per-day state — keyed by datetime.date (NY)
+    day_states:    dict  = None
 
     def __post_init__(self):
         if self.days_traded is None:
             self.days_traded = set()
+        if self.day_states is None:
+            self.day_states = {}
 
-    def get_day(self, trade_date) -> DayState:
-        if self.current_day is None or self.current_day.date != trade_date:
-            self.current_day = DayState(date=trade_date)
-        return self.current_day
-
-    def risk_multiplier(self) -> float:
-        closed = self.weekly_wins + self.weekly_losses
-        if closed == 0:
-            return 1.0
-        if self.weekly_wins >= 1:
-            return 0.5
-        if self.weekly_losses >= 2:
-            return 0.5
-        return 1.0
+    def get_day(self, trade_date) -> "DayState":
+        if trade_date not in self.day_states:
+            self.day_states[trade_date] = DayState(date=trade_date)
+        return self.day_states[trade_date]
 
 
 @dataclass
@@ -269,22 +247,27 @@ def is_valid_trading_time(
     candle: Candle,
     entry_candle: Candle | None = None,
 ) -> tuple[bool, str]:
+    """Enforce Tue-Thu only, 02:00–10:59 NY time (strict < 11:00)."""
     ny = candle.opened_ny
     if ny.weekday() not in VALID_WEEKDAYS:
-        return False, f"Invalid day: {ny.strftime('%A')}"
+        day_name = ny.strftime("%A")
+        return False, f"Invalid day: {day_name} (must be Tue/Wed/Thu)"
     t = (ny.hour, ny.minute)
+    # Signal candle must be at or after 02:00 and strictly before 11:00
     if t < SESSION_START:
         return False, f"Before session: {ny.strftime('%H:%M')} NY"
-    if t >= (11, 0):
-        return False, f"Signal too late: {ny.strftime('%H:%M')} NY"
+    if t >= SESSION_END:
+        return False, f"Signal too late (>= 11:00 NY): {ny.strftime('%H:%M')} NY"
+    # Entry candle (next H1 bar open) must also be before 11:00
     if entry_candle is not None:
         eny = entry_candle.opened_ny
-        if (eny.hour, eny.minute) >= (12, 0):
+        if (eny.hour, eny.minute) >= SESSION_END:
             return False, f"Entry candle outside window: {eny.strftime('%H:%M')} NY"
     return True, ""
 
 
 def week_key(dt: datetime) -> str:
+    """Returns e.g. '2024-W03' using NY time."""
     ny = utc_to_ny(dt)
     iso = ny.isocalendar()
     return f"{iso.year}-W{iso.week:02d}"
@@ -293,6 +276,10 @@ def week_key(dt: datetime) -> str:
 def month_key(dt: datetime) -> str:
     ny = utc_to_ny(dt)
     return f"{ny.year}-{ny.month:02d}"
+
+
+def is_new_week(dt: datetime, last_week: str) -> bool:
+    return week_key(dt) != last_week
 
 
 def format_ny(dt: datetime | None) -> str:
@@ -339,11 +326,7 @@ def load_history(timeframe: str) -> list[Candle]:
     return sorted(candles, key=lambda c: c.opened_at)
 
 
-def closed_as_of(
-    candles: list[Candle],
-    timeframe: str,
-    as_of: datetime,
-) -> list[Candle]:
+def closed_as_of(candles: list[Candle], timeframe: str, as_of: datetime) -> list[Candle]:
     dur = TIMEFRAME_DURATIONS[timeframe]
     return [c for c in candles if c.opened_at + dur <= as_of]
 
@@ -353,13 +336,14 @@ def closed_as_of(
 NEWS_FULL_DAY    = {"NFP", "NONFARM", "NON-FARM", "FOMC", "FED RATE",
                     "RATE DECISION", "INTEREST RATE", "MONETARY POLICY"}
 NEWS_PRE_RELEASE = {"CPI", "CORE CPI", "PCE", "GDP", "RETAIL SALES"}
+CPI_BUFFER_MINS  = 5
 
 
 @dataclass(frozen=True)
 class NewsEvent:
     name:         str
-    event_type:   str
-    release_time: datetime
+    event_type:   str       # "FULL_DAY" or "PRE_RELEASE"
+    release_time: datetime  # UTC
 
 
 def classify_news(name: str) -> str:
@@ -375,8 +359,8 @@ def load_news(news_csv: Path) -> list[NewsEvent]:
         return events
     with news_csv.open("r", encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
-            name  = str(row.get("event", "")).strip()
-            raw   = str(row.get("time_ny", "")).strip()
+            name = str(row.get("event", "")).strip()
+            raw  = str(row.get("time_ny", "")).strip()
             etype = classify_news(name)
             if etype == "IGNORE":
                 continue
@@ -393,10 +377,7 @@ def load_news(news_csv: Path) -> list[NewsEvent]:
     return events
 
 
-def get_cpi_this_week(
-    candle_time: datetime,
-    events: list[NewsEvent],
-) -> datetime | None:
+def get_cpi_this_week(candle_time: datetime, events: list[NewsEvent]) -> datetime | None:
     days_since_mon = candle_time.weekday()
     week_start = (candle_time - timedelta(days=days_since_mon)).replace(
         hour=0, minute=0, second=0, microsecond=0)
@@ -413,27 +394,49 @@ def is_news_blocked(
     events: list[NewsEvent],
     cpi_this_week: datetime | None,
 ) -> tuple[bool, str]:
+    """
+    Rules from rules.docx:
+      NFP day            → full day block
+      FOMC + Rate same day → full day block + next day blocked
+      FOMC alone         → tradeable (no block)
+      CPI                → blocked until release + 10 min
+      Major USD news     → tradeable
+    """
     date = candle_time.date()
-    todays    = [e for e in events if e.event_type == "FULL_DAY"
-                 and e.release_time.date() == date]
-    yesterdays = [e for e in events if e.event_type == "FULL_DAY"
-                  and (date - e.release_time.date()).days == 1]
-    names_today     = [e.name.upper() for e in todays]
-    names_yesterday = [e.name.upper() for e in yesterdays]
 
-    if any("NFP" in n or "NONFARM" in n or "NON-FARM" in n for n in names_today):
-        return True, "NFP day"
+    # Collect today's events
+    todays_events = [
+        e for e in events
+        if e.event_type == "FULL_DAY" and e.release_time.date() == date
+    ]
+    yesterdays_events = [
+        e for e in events
+        if e.event_type == "FULL_DAY"
+        and (date - e.release_time.date()).days == 1
+    ]
+    event_names_today = [e.name.upper() for e in todays_events]
+    event_names_yesterday = [e.name.upper() for e in yesterdays_events]
 
-    fomc_today = any("FOMC" in n for n in names_today)
-    rate_today = any("RATE" in n or "INTEREST" in n for n in names_today)
-    if fomc_today and rate_today:
-        return True, "FOMC + Rate Decision"
+    # NFP — full day block
+    if any("NFP" in n or "NONFARM" in n or "NON-FARM" in n
+           for n in event_names_today):
+        return True, "NFP day — no trading"
 
-    fomc_yst = any("FOMC" in n for n in names_yesterday)
-    rate_yst = any("RATE" in n or "INTEREST" in n for n in names_yesterday)
-    if fomc_yst and rate_yst:
-        return True, "Day after FOMC + Rate Decision"
+    # FOMC + Rate decision same day — block today AND next day
+    has_fomc_today = any("FOMC" in n for n in event_names_today)
+    has_rate_today = any("RATE" in n or "INTEREST" in n
+                         for n in event_names_today)
+    if has_fomc_today and has_rate_today:
+        return True, "FOMC + Rate Decision — no trading"
 
+    # Next day after FOMC + Rate decision — also blocked
+    has_fomc_yesterday = any("FOMC" in n for n in event_names_yesterday)
+    has_rate_yesterday = any("RATE" in n or "INTEREST" in n
+                             for n in event_names_yesterday)
+    if has_fomc_yesterday and has_rate_yesterday:
+        return True, "Day after FOMC + Rate Decision — no trading"
+
+    # CPI — block until release + 10 min buffer
     if cpi_this_week is not None:
         clear = cpi_this_week + timedelta(minutes=CPI_BUFFER_MINS)
         if candle_time < clear:
@@ -444,9 +447,7 @@ def is_news_blocked(
 
 # ── Technical helpers ─────────────────────────────────────────────────────────
 
-def detect_swings(
-    candles: list[Candle],
-) -> tuple[list[SwingPoint], list[SwingPoint]]:
+def detect_swings(candles: list[Candle]) -> tuple[list[SwingPoint], list[SwingPoint]]:
     highs: list[SwingPoint] = []
     lows:  list[SwingPoint] = []
     for i in range(1, len(candles) - 1):
@@ -456,6 +457,27 @@ def detect_swings(
         if c.low < p.low and c.low < n.low:
             lows.append(SwingPoint(c.time_str, c.low, "LOW"))
     return highs, lows
+
+
+def classify_trend(candles: list[Candle]) -> str:
+    highs, lows = detect_swings(candles[-120:])
+    if len(highs) < 3 or len(lows) < 3:
+        return "NO_TRADE"
+    rh, rl = highs[-3:], lows[-3:]
+    hh = sum(1 for a, b in zip(rh, rh[1:]) if b.price > a.price)
+    hl = sum(1 for a, b in zip(rl, rl[1:]) if b.price > a.price)
+    lh = sum(1 for a, b in zip(rh, rh[1:]) if b.price < a.price)
+    ll = sum(1 for a, b in zip(rl, rl[1:]) if b.price < a.price)
+    if hh >= 2 and hl >= 2: return "BULLISH"
+    if lh >= 2 and ll >= 2: return "BEARISH"
+    return "NO_TRADE"
+
+
+def technical_bias(d1: list[Candle], h4: list[Candle]) -> str:
+    bias = classify_trend(d1)
+    if bias in {"BULLISH", "BEARISH"}:
+        return bias
+    return classify_trend(h4)
 
 
 def average_true_range(candles: list[Candle], period: int = 14) -> float:
@@ -470,359 +492,21 @@ def average_true_range(candles: list[Candle], period: int = 14) -> float:
     return sum(trs) / len(trs) if trs else 0.0
 
 
-# ── NEW BIAS ENGINE (4-variable scoring system) ───────────────────────────────
-
-def _three_months_candles(candles: list[Candle]) -> list[Candle]:
-    """Return candles from the last 3 months (approx 90 days)."""
-    cutoff = candles[-1].opened_at - timedelta(days=90)
-    result = [c for c in candles if c.opened_at >= cutoff]
-    return result if result else candles
-
-
-def _three_weeks_candles(candles: list[Candle]) -> list[Candle]:
-    """Return candles from the last 3 weeks (approx 21 days)."""
-    cutoff = candles[-1].opened_at - timedelta(days=21)
-    result = [c for c in candles if c.opened_at >= cutoff]
-    return result if result else candles
-
-
-# ── Variable 1: Market Trend ──────────────────────────────────────────────────
-
-def _trend_score(candles: list[Candle]) -> tuple[int, int]:
-    """
-    Score trend direction using last 3 months of data.
-    Looks for HH+HL sequence (bullish) or LH+LL sequence (bearish).
-    Uses the last 40 candles within that window for swing detection
-    to keep it sensitive enough for D1 and H4.
-
-    Returns (bull_score, bear_score) — max 1 point per timeframe.
-    """
-    window = _three_months_candles(candles)
-    highs, lows = detect_swings(window[-40:])
-    if len(highs) < 2 or len(lows) < 2:
-        return 0, 0
-    rh, rl = highs[-2:], lows[-2:]
-    hh = rh[1].price > rh[0].price
-    hl = rl[1].price > rl[0].price
-    lh = rh[1].price < rh[0].price
-    ll = rl[1].price < rl[0].price
-    if hh and hl: return 1, 0
-    if lh and ll: return 0, 1
-    return 0, 0
-
-
-def variable1_trend(
-    d1: list[Candle],
-    h4: list[Candle],
-) -> tuple[int, int]:
-    """
-    Variable 1 — Market Trend. Weight: 3 points total.
-
-    D1 contributes up to 2 points (stronger weight).
-    H4 contributes up to 1 point (supporting weight).
-    Both use last 3 months of data.
-
-    Score table:
-      D1 bullish trend    → bull +2
-      D1 bearish trend    → bear +2
-      H4 bullish trend    → bull +1
-      H4 bearish trend    → bear +1
-    """
-    d1_bull, d1_bear = _trend_score(d1)
-    h4_bull, h4_bear = _trend_score(h4)
-
-    bull = d1_bull * 2 + h4_bull * 1
-    bear = d1_bear * 2 + h4_bear * 1
-    return bull, bear
-
-
-# ── Variable 2: Swing Point Respect ──────────────────────────────────────────
-
-def _swing_respect_pct(
-    candles: list[Candle],
-    bias: str,
-) -> float:
-    """
-    Check what percentage of recent swing points are being respected
-    (not violated) using the last 3 weeks of data.
-
-    For BULLISH bias: check swing lows — are they holding (price hasn't
-    closed below them)?
-    For BEARISH bias: check swing highs — are they holding (price hasn't
-    closed above them)?
-
-    A swing point is VIOLATED when a candle closes beyond it.
-    Returns the percentage of swing points that are intact (0.0 to 1.0).
-    """
-    window = _three_weeks_candles(candles)
-    if len(window) < 5:
-        return 0.0
-
-    highs, lows = detect_swings(window)
-
-    if bias == "BULLISH":
-        pivots = lows[-6:] if lows else []   # last 6 swing lows
-        if not pivots:
-            return 0.0
-        latest_close = candles[-1].close
-        # Respected = close has not gone below this swing low
-        respected = sum(1 for p in pivots if latest_close > p.price)
-        return respected / len(pivots)
-
-    else:  # BEARISH
-        pivots = highs[-6:] if highs else []  # last 6 swing highs
-        if not pivots:
-            return 0.0
-        latest_close = candles[-1].close
-        # Respected = close has not gone above this swing high
-        respected = sum(1 for p in pivots if latest_close < p.price)
-        return respected / len(pivots)
-
-
-def variable2_swing_respect(
-    d1: list[Candle],
-    h4: list[Candle],
-    current_bias_hint: str = "BULLISH",
-) -> tuple[int, int]:
-    """
-    Variable 2 — Swing Point Respect. Weight: 3 points total.
-
-    Checks both D1 and H4 swing points using last 3 weeks.
-    Equal weight between D1 and H4 (1.5 points each, rounded).
-
-    Threshold: 60-70% respected = confirms the bias.
-    Score table (per timeframe, per direction):
-      70%+ respected     → +2 (strong confirmation)
-      60-70% respected   → +1 (moderate confirmation)
-      below 60%          → 0
-    """
-    bull_score = 0
-    bear_score = 0
-
-    for candles in (d1, h4):
-        bull_pct = _swing_respect_pct(candles, "BULLISH")
-        bear_pct = _swing_respect_pct(candles, "BEARISH")
-
-        # Bullish swing respect (swing lows holding)
-        if bull_pct >= 0.70:
-            bull_score += 2
-        elif bull_pct >= 0.60:
-            bull_score += 1
-
-        # Bearish swing respect (swing highs holding)
-        if bear_pct >= 0.70:
-            bear_score += 2
-        elif bear_pct >= 0.60:
-            bear_score += 1
-
-    # Cap at 3 per side (two timeframes each contributing up to 2 = 4 max,
-    # but we cap at 3 to keep weights balanced with Variable 1)
-    return min(bull_score, 3), min(bear_score, 3)
-
-
-# ── Variable 3: Premium / Discount Zone ──────────────────────────────────────
-
-def variable3_premium_discount(
-    d1: list[Candle],
-    h4: list[Candle],
-    current_price: float,
-) -> tuple[int, int]:
-    """
-    Variable 3 — Premium/Discount Zone. Weight: 2 points total.
-
-    Uses 3-month high/low range to calculate the 50% Fibonacci level.
-    Checks both D1 and H4 independently.
-
-    Score table (per timeframe):
-      Price at or below 50% (ideal discount)   → bull +1
-      Price between 50-60% (valid discount)    → bull +0  (neutral zone)
-      Price at or above 50% (ideal premium)    → bear +1
-      Price between 40-50% (valid premium)     → bear +0  (neutral zone)
-
-    Total max = 2 bull or 2 bear (one point per timeframe).
-    """
-    bull_score = 0
-    bear_score = 0
-
-    for candles in (d1, h4):
-        window = _three_months_candles(candles)
-        if not window:
-            continue
-        range_high = max(c.high for c in window)
-        range_low  = min(c.low  for c in window)
-        span = range_high - range_low
-        if span <= 0:
-            continue
-
-        # Fibonacci level as percentage from low
-        pct_from_low = (current_price - range_low) / span
-
-        # Below 50% = discount (ideal buy zone)
-        if pct_from_low <= 0.50:
-            bull_score += 1
-        # Above 50% = premium (ideal sell zone)
-        elif pct_from_low >= 0.50:
-            bear_score += 1
-        # Exactly at 50% = neutral, no score for either
-
-    return bull_score, bear_score
-
-
-# ── Variable 4: Power of 3 — Weekly ──────────────────────────────────────────
-
-def variable4_power_of_3(
-    d1: list[Candle],
-    w1: list[Candle],
-    current_price: float,
-    as_of: datetime,
-) -> tuple[int, int]:
-    """
-    Variable 4 — Power of 3 Weekly. Weight: 1 point (with -1 penalty).
-
-    Checks whether the current week's price action has taken out last
-    week's high or low first. Dynamically updated as the week progresses.
-
-    What "taken out" means: a candle CLOSED beyond the level.
-
-    For BULLISH context:
-      If price FIRST swept the weekly LOW before taking the high
-      → bullish favour (+1 bull)
-      If price FIRST swept the weekly HIGH before taking the low
-      → decreases bullish probability (-1 penalty on bull)
-
-    For BEARISH context: vice versa.
-
-    We look at last week's high and low from D1/W1 candles.
-    Then check current week's D1 candles to see which was taken first.
-    """
-    # Get last week's high and low from W1
-    if len(w1) < 2:
-        return 0, 0
-
-    last_week_candle = w1[-2]   # previous completed week
-    last_week_high   = last_week_candle.high
-    last_week_low    = last_week_candle.low
-
-    # Find start of current week (most recent Monday)
-    now_ny = utc_to_ny(as_of)
-    days_since_mon = now_ny.weekday()
-    week_start_ny = (now_ny - timedelta(days=days_since_mon)).replace(
-        hour=0, minute=0, second=0, microsecond=0)
-    week_start_utc = week_start_ny.astimezone(timezone.utc)
-
-    # Get current week's D1 candles (candles that opened after week start)
-    current_week_d1 = [c for c in d1 if c.opened_at >= week_start_utc]
-    if not current_week_d1:
-        return 0, 0
-
-    # Walk through current week's candles in order
-    # Check which level was taken out first (close beyond level = taken out)
-    high_taken_first = False
-    low_taken_first  = False
-    for c in current_week_d1:
-        if not high_taken_first and not low_taken_first:
-            if c.close > last_week_high:
-                high_taken_first = True
-                break
-            if c.close < last_week_low:
-                low_taken_first = True
-                break
-
-    # Score:
-    # Low taken first → bullish favour (liquidity below swept, reversal up)
-    # High taken first → bearish favour (liquidity above swept, reversal down)
-    # In bullish context, high taken first DECREASES probability → penalty
-    # In bearish context, low taken first DECREASES probability → penalty
-
-    if low_taken_first:
-        return 1, 0    # bullish favour
-    elif high_taken_first:
-        return 0, 1    # bearish favour
-    else:
-        return 0, 0    # neither taken out yet — neutral
-
-
-# ── Bias Engine: combine all 4 variables ─────────────────────────────────────
-
-def calculate_bias(
-    d1: list[Candle],
-    h4: list[Candle],
-    w1: list[Candle],
-    current_price: float,
-    as_of: datetime,
-) -> BiasResult:
-    """
-    4-variable bias scoring system.
-
-    Weights:
-      Variable 1 — Trend:          max 3 points (D1=2, H4=1)
-      Variable 2 — Swing respect:  max 3 points (D1+H4 combined, capped at 3)
-      Variable 3 — Premium/Disc:   max 2 points (D1+H4, 1 each)
-      Variable 4 — Power of 3:     max 1 point  (with -1 penalty possible)
-
-    Maximum possible: 9 bull or 9 bear.
-
-    Final bias decision:
-      Bull ≥ 7 and beats bear by 2+              → BULLISH HIGH
-      Bull 5-6 and beats bear by 2+              → BULLISH MEDIUM
-      Bear ≥ 7 and beats bear by 2+              → BEARISH HIGH
-      Bear 5-6 and beats bear by 2+              → BEARISH MEDIUM
-      Scores within 2 of each other              → NO_TRADE (too close)
-      Both below 5                               → NO_TRADE (no conviction)
-    """
-    # Variable 1
-    v1_bull, v1_bear = variable1_trend(d1, h4)
-
-    # Variable 2
-    v2_bull, v2_bear = variable2_swing_respect(d1, h4)
-
-    # Variable 3
-    v3_bull, v3_bear = variable3_premium_discount(d1, h4, current_price)
-
-    # Variable 4
-    v4_bull, v4_bear = variable4_power_of_3(d1, w1, current_price, as_of)
-
-    # Apply Power of 3 penalty
-    # If price took out last week HIGH first (bearish signal) in a bullish context
-    # → subtract 1 from bull total (reduce probability as per notes)
-    bull_total = v1_bull + v2_bull + v3_bull + v4_bull
-    bear_total = v1_bear + v2_bear + v3_bear + v4_bear
-
-    # Apply cross-penalty: PO3 against the direction reduces that direction's score
-    if v4_bear > 0:   # high taken first — penalise bulls
-        bull_total = max(0, bull_total - 1)
-    if v4_bull > 0:   # low taken first — penalise bears
-        bear_total = max(0, bear_total - 1)
-
-    # Determine final bias
-    gap = abs(bull_total - bear_total)
-
-    final_bias = "NO_TRADE"
-    conviction = "NONE"
-
-    if bull_total > bear_total and gap >= 2:
-        final_bias = "BULLISH"
-        conviction = "HIGH" if bull_total >= 7 else "MEDIUM" if bull_total >= 5 else "LOW"
-    elif bear_total > bull_total and gap >= 2:
-        final_bias = "BEARISH"
-        conviction = "HIGH" if bear_total >= 7 else "MEDIUM" if bear_total >= 5 else "LOW"
-    # else: too close → NO_TRADE
-
-    return BiasResult(
-        trend_bull=v1_bull,  trend_bear=v1_bear,
-        swing_bull=v2_bull,  swing_bear=v2_bear,
-        zone_bull=v3_bull,   zone_bear=v3_bear,
-        po3_bull=v4_bull,    po3_bear=v4_bear,
-        bull_total=bull_total,
-        bear_total=bear_total,
-        final_bias=final_bias,
-        conviction=conviction,
-    )
-
-
 # ── FVG helpers ───────────────────────────────────────────────────────────────
+def as_fvg_candles(candles: list[Candle]):
+    result = []
+    for c in candles:
+        obj = type('C', (), {
+            'time': c.time_str, 'open': c.open,
+            'high': c.high, 'low': c.low, 'close': c.close,
+            'body_size': abs(c.close - c.open),
+            'range_size': c.high - c.low,
+        })()
+        result.append(obj)
+    return result
 
-def as_fvg_candles(candles: list[Candle]) -> list:
+def as_fvg_candles_simple(candles: list[Candle]) -> list:
+    """Convert backtest Candles to simple objects FVGs.py can consume."""
     result = []
     for c in candles:
         obj = type('C', (), {
@@ -835,13 +519,8 @@ def as_fvg_candles(candles: list[Candle]) -> list:
     return result
 
 
-def as_fvg_candles_simple(candles: list[Candle]) -> list:
-    return as_fvg_candles(candles)
-
-
-def build_fvg_cache(
-    history: dict[str, list[Candle]],
-) -> dict[str, list[DetectedFVG]]:
+def build_fvg_cache(history: dict[str, list[Candle]]) -> dict[str, list[DetectedFVG]]:
+    """Build FVG cache for ALL timeframes including H1 — needed for entry signals."""
     return {
         tf: detect_fvgs(as_fvg_candles(history[tf]), tf)
         for tf in ("W1", "D1", "H4", "H1")
@@ -854,6 +533,11 @@ def fvg_still_valid(
     timeframe: str,
     as_of: datetime,
 ) -> bool:
+    """
+    FVG is invalid only if a candle CLOSED fully through the zone
+    with a $5 buffer — partial closes inside the zone are normal
+    price behaviour and do not invalidate the FVG.
+    """
     formed_at = parse_time(fvg.formed_time)
     if formed_at + TIMEFRAME_DURATIONS[timeframe] > as_of:
         return False
@@ -875,6 +559,12 @@ def choose_htf_area(
     as_of: datetime,
     bias: str,
 ) -> DetectedFVG | None:
+    """
+    Layer 1 — Find the HTF area of interest (W1, D1, H4 FVG).
+    This is NOT the entry — it defines the price area we expect
+    price to react from. Entry happens on H1 FVG inside this area.
+    If no HTF FVG exists, use the most recent significant swing level.
+    """
     candidates = []
     for tf, weight in (("W1", 4), ("D1", 3), ("H4", 2)):
         for fvg in fvg_cache.get(tf, []):
@@ -890,30 +580,6 @@ def choose_htf_area(
     return sorted(candidates, key=lambda x: (x[0], x[1]), reverse=True)[0][2]
 
 
-def recent_price_leg(
-    candles: list[Candle],
-    lookback: int = 20,
-) -> tuple[float, float, float]:
-    recent = candles[-lookback:] if len(candles) >= lookback else candles
-    high = max(c.high for c in recent)
-    low  = min(c.low  for c in recent)
-    mid  = (high + low) / 2
-    return high, low, mid
-
-
-def fvg_in_optimal_zone(
-    fvg: DetectedFVG,
-    bias: str,
-    leg_high: float,
-    leg_low: float,
-    leg_mid: float,
-) -> bool:
-    fvg_center = (fvg.top + fvg.bottom) / 2
-    if bias == "BULLISH":
-        return fvg_center <= leg_mid
-    return fvg_center >= leg_mid
-
-
 def find_entry_fvg(
     history: dict[str, list[Candle]],
     fvg_cache: dict[str, list[DetectedFVG]],
@@ -921,10 +587,18 @@ def find_entry_fvg(
     bias: str,
     current_price: float,
     htf_area: DetectedFVG | None,
-    h1: list[Candle],
-    h4: list[Candle],
 ) -> DetectedFVG | None:
-    leg_high, leg_low, leg_mid = recent_price_leg(h4[-20:] if h4 else h1[-80:])
+    """
+    Layer 2 — Find the H1 or H4 entry FVG.
+
+    ICT entry model:
+      - Scan H4 then H1 FVGs in bias direction
+      - Price must be inside or have just entered the FVG
+      - If an HTF area exists, prefer FVGs inside it (but don't require it)
+      - Most recently formed FVG that price is currently touching = entry
+
+    This is the actual entry zone where we place the trade.
+    """
     entry_candidates = []
 
     for tf, weight in (("H4", 3), ("H1", 2)):
@@ -932,30 +606,28 @@ def find_entry_fvg(
             if fvg.direction != bias:
                 continue
             formed = parse_time(fvg.formed_time)
-            if formed < as_of - timedelta(days=14):
+            # Only FVGs formed in last 5 days — fresh entries only
+            if formed < as_of - timedelta(days=5):
                 continue
             if not fvg_still_valid(fvg, history[tf], tf, as_of):
                 continue
+            # Price must be inside the FVG (hard rule from rules doc)
+            # Using $10 tolerance for XAUUSD spread and wick precision
             if not fvg.overlaps_price(current_price, tolerance=10.0):
                 continue
 
-            zone_bonus = 1 if fvg_in_optimal_zone(fvg, bias, leg_high, leg_low, leg_mid) else 0
-
+            # Bonus if this entry FVG sits inside the HTF area of interest
             htf_bonus = 0
             if htf_area is not None:
                 overlap = (
-                    max(fvg.bottom, htf_area.bottom) 
-                    -min(fvg.top, htf_area.top)
+                   max(fvg.bottom, htf_area.bottom)
+                   <=
+                   min(fvg.top, htf_area.top)
                 )
                 if overlap:
                     htf_bonus = 2
 
-            days_old   = (as_of - formed).days
-            week_bonus = 1 if days_old <= 7 else 0
-
-            entry_candidates.append(
-                (weight + htf_bonus + zone_bonus + week_bonus, formed, fvg)
-            )
+            entry_candidates.append((weight + htf_bonus, formed, fvg))
 
     if not entry_candidates:
         return None
@@ -967,70 +639,70 @@ def find_entry_fvg(
 def detect_liquidity_sweep(
     h1: list[Candle],
     bias: str,
-    d1: list[Candle] | None = None,
 ) -> tuple[bool, float | None]:
-    if len(h1) < 5:
+    """
+    Check if the most recent candle swept equal highs/lows
+    and closed back the other side — manipulation confirmed.
+    Uses last 12 candles as the lookback for equal levels.
+    """
+    if len(h1) < 13:
         return False, None
 
-    latest    = h1[-1]
-    tolerance = 2.0
-    levels: list[float] = []
-
-    if len(h1) >= 25:
-        prev_day = h1[-25:-1]
-        levels.append(min(c.low  for c in prev_day))
-        levels.append(max(c.high for c in prev_day))
-
-    if len(h1) >= 121:
-        prev_week = h1[-121:-1]
-        levels.append(min(c.low  for c in prev_week))
-        levels.append(max(c.high for c in prev_week))
-
-    all_highs, all_lows = detect_swings(h1[-120:])
-    eq_tol = 0.0015
-
-    for i in range(len(all_highs)):
-        for j in range(i + 1, len(all_highs)):
-            a, b = all_highs[i].price, all_highs[j].price
-            avg  = (a + b) / 2
-            if avg > 0 and abs(a - b) / avg <= eq_tol:
-                levels.append(avg)
-
-    for i in range(len(all_lows)):
-        for j in range(i + 1, len(all_lows)):
-            a, b = all_lows[i].price, all_lows[j].price
-            avg  = (a + b) / 2
-            if avg > 0 and abs(a - b) / avg <= eq_tol:
-                levels.append(avg)
+    latest = h1[-1]
+    prior  = h1[-13:-1]
+    tolerance = 2.0   # $2 tolerance for "equal" levels on XAUUSD
 
     if bias == "BULLISH":
-        ssl = [l for l in levels if l < latest.close]
-        for level in sorted(ssl, reverse=True):
-            if latest.low <= (level + tolerance) and latest.close > level:
-                return True, level
+        # Looking for SSL sweep: price sweeps below equal lows then closes above
+        level = min(c.low for c in prior)
+        swept = latest.low <= (level + tolerance) and latest.close > level
+        return swept, level if swept else None
     else:
-        bsl = [l for l in levels if l > latest.close]
-        for level in sorted(bsl):
-            if latest.high >= (level - tolerance) and latest.close < level:
-                return True, level
-
-    return False, None
+        # Looking for BSL sweep: price sweeps above equal highs then closes below
+        level = max(c.high for c in prior)
+        swept = latest.high >= (level - tolerance) and latest.close < level
+        return swept, level if swept else None
 
 
 # ── SL / TP ───────────────────────────────────────────────────────────────────
-
 def find_sl_price(
     bias: str,
     entry: float,
     h1: list[Candle],
     entry_fvg: DetectedFVG | None = None,
 ) -> tuple[float | None, float]:
-    sl_distance = round(entry * SL_PCT, 2)
-    if bias == "BULLISH":
-        sl = round(entry - sl_distance, 2)
-    else:
-        sl = round(entry + sl_distance, 2)
-    return sl, sl_distance
+    """
+    SL placement — rules doc: 10-30 pips, but SL can be short.
+    Priority order:
+      1. Below/above the entry FVG zone edge (tightest, most precise)
+      2. Nearest H1 swing within 10-50 pip range
+      3. Fallback: minimum SL distance
+    """
+    # Option 1: SL just beyond the entry FVG boundary
+    if entry_fvg is not None:
+        buffer = 2.0  # $2 beyond zone
+        if bias == "BULLISH":
+            fvg_sl = entry_fvg.bottom - buffer
+            dist   = abs(entry - fvg_sl)
+            if MIN_SL_PIPS <= dist <= MAX_SL_PIPS:
+                return fvg_sl, dist
+        else:
+            fvg_sl = entry_fvg.top + buffer
+            dist   = abs(entry - fvg_sl)
+            if MIN_SL_PIPS <= dist <= MAX_SL_PIPS:
+                return fvg_sl, dist
+
+    # Option 2: nearest swing within range
+    highs, lows = detect_swings(h1[-80:])
+    swings = lows if bias == "BULLISH" else highs
+    for sw in reversed(swings):
+        dist = abs(entry - sw.price)
+        if MIN_SL_PIPS <= dist <= MAX_SL_PIPS:
+            return sw.price, dist
+
+    # Option 3: fallback to minimum
+    sl = entry - MIN_SL_PIPS if bias == "BULLISH" else entry + MIN_SL_PIPS
+    return sl, MIN_SL_PIPS
 
 
 def find_tp_price(
@@ -1039,76 +711,58 @@ def find_tp_price(
     sl: float,
     d1: list[Candle],
     h4: list[Candle],
-    h1: list[Candle],
 ) -> tuple[float | None, float]:
+    """
+    TP = nearest significant liquidity pool beyond entry.
+    Research: price moves from liquidity pool to liquidity pool.
+
+    Priority:
+      1. Previous D1 high/low (weekly dealing range)
+      2. H4 swing high/low beyond entry
+      3. Projected 1:2 minimum from entry
+    All targets must achieve MIN_RR 1:2.
+    """
     risk = abs(entry - sl)
     if risk <= 0:
         return None, 0.0
 
-    targets: list[tuple[float, int]] = []
+    targets: list[float] = []
 
-    d1_highs, d1_lows = detect_swings(d1[-40:])
-    h4_highs, h4_lows = detect_swings(h4[-80:])
-    h1_highs, h1_lows = detect_swings(h1[-120:])
-
-    all_highs = d1_highs + h4_highs + h1_highs
-    all_lows  = d1_lows  + h4_lows  + h1_lows
-    tol_pct   = 0.0015
-
+    # D1 swing highs/lows (last 20 candles)
+    d1_highs, d1_lows = detect_swings(d1[-20:])
     if bias == "BULLISH":
-        for i in range(len(all_highs)):
-            for j in range(i + 1, len(all_highs)):
-                a, b = all_highs[i].price, all_highs[j].price
-                avg  = (a + b) / 2
-                if avg <= entry: continue
-                if abs(a - b) / avg <= tol_pct:
-                    targets.append((avg, 1))
+        targets += [s.price for s in d1_highs if s.price > entry]
     else:
-        for i in range(len(all_lows)):
-            for j in range(i + 1, len(all_lows)):
-                a, b = all_lows[i].price, all_lows[j].price
-                avg  = (a + b) / 2
-                if avg >= entry: continue
-                if abs(a - b) / avg <= tol_pct:
-                    targets.append((avg, 1))
+        targets += [s.price for s in d1_lows  if s.price < entry]
 
+    # H4 swing highs/lows (last 40 candles)
+    h4_highs, h4_lows = detect_swings(h4[-40:])
     if bias == "BULLISH":
-        targets += [(s.price, 2) for s in d1_highs if s.price > entry]
+        targets += [s.price for s in h4_highs if s.price > entry]
     else:
-        targets += [(s.price, 2) for s in d1_lows  if s.price < entry]
+        targets += [s.price for s in h4_lows  if s.price < entry]
 
-    if bias == "BULLISH":
-        targets += [(s.price, 3) for s in h4_highs if s.price > entry]
-    else:
-        targets += [(s.price, 3) for s in h4_lows  if s.price < entry]
+    # Previous D1 candle high/low as fallback
+    if len(d1) >= 2:
+        prev = d1[-2]
+        if bias == "BULLISH" and prev.high > entry:
+            targets.append(prev.high)
+        elif bias == "BEARISH" and prev.low < entry:
+            targets.append(prev.low)
 
-    if len(d1) >= 6:
-        prev_week = d1[-6:-1]
-        if bias == "BULLISH":
-            pw_high = max(c.high for c in prev_week)
-            if pw_high > entry:
-                targets.append((pw_high, 4))
-        else:
-            pw_low = min(c.low for c in prev_week)
-            if pw_low < entry:
-                targets.append((pw_low, 4))
-
-    valid: list[tuple[int, float, float]] = []
-    for price, priority in targets:
-        rr = abs(price - entry) / risk
+    # Find the nearest target that gives at least 1:2
+    valid = []
+    for t in targets:
+        rr = abs(t - entry) / risk
         if rr >= MIN_RR:
-            valid.append((priority, abs(price - entry), price))
+            valid.append((abs(t - entry), t, rr))
 
     if valid:
-        valid.sort(key=lambda x: (x[0], -x[1]))
-        priority, dist, tp = valid[0]
-        rr = dist / risk
-        # Cap at 5R to avoid unrealistic targets
-        if rr > 5.0:
-            tp = (entry + risk * 5.0) if bias == "BULLISH" else (entry - risk * 5.0)
-            rr = 5.0
+        # Pick the closest valid target — more achievable
+        _, tp, rr = sorted(valid)[0]
         return tp, rr
 
+    # Fallback: project 1:2 minimum
     min_tp = (entry + risk * MIN_RR) if bias == "BULLISH" else (entry - risk * MIN_RR)
     return min_tp, MIN_RR
 
@@ -1128,108 +782,98 @@ def calculate_ttps(
     h4: list[Candle],
     h1: list[Candle],
     entry_price: float,
-    bias_result: BiasResult | None = None,
 ) -> tuple[int, int, int, int, int, str]:
     """
     TTPS scoring — 4 dimensions, 5 points each = 20 total.
+    Returns (htf, entry, session, risk, total, grade)
 
-    HTF Bias dimension now uses the bias engine scores instead of
-    re-running classify_trend, for consistency.
+    Dimension 1 — HTF Bias (0-5):
+      +2  D1 trend matches bias
+      +2  H4 trend matches bias
+      +1  W1 candle direction matches (close > open = bullish)
+
+    Dimension 2 — Entry Confluence (0-5):
+      +3  Liquidity sweep confirmed
+      +1  Price inside FVG at entry
+      +1  H4 FVG also present at entry level
+
+    Dimension 3 — Session Quality (0-5):
+      +2  London session (02:00-05:00 NY)
+      +3  London-NY overlap (08:00-11:00 NY)
+      +1  NY morning (05:00-08:00 NY)
+
+    Dimension 4 — Risk Quality (0-5):
+      +2  SL within 20-25 pip range (tighter = better)
+      +1  SL within 25-30 pip range
+      +2  R:R >= 2.5
+      +1  R:R >= 2.0 but < 2.5
     """
-    # Dim 1: HTF Bias — use bias engine if available
+
+    # Dim 1: HTF Bias
+    d1_bias = classify_trend(d1)
+    h4_bias = classify_trend(h4)
     htf = 0
-    if bias_result is not None:
-        # Scale bias engine scores into TTPS 0-5 range
-        if bias == "BULLISH":
-            htf = min(5, bias_result.bull_total)
-        else:
-            htf = min(5, bias_result.bear_total)
-    else:
-        # Fallback: simple swing check
-        d1_highs, d1_lows = detect_swings(d1[-40:])
-        h4_highs, h4_lows = detect_swings(h4[-40:])
-        def simple_trend(highs, lows):
-            if len(highs) < 2 or len(lows) < 2: return "NO_TRADE"
-            hh = highs[-1].price > highs[-2].price
-            hl = lows[-1].price  > lows[-2].price
-            lh = highs[-1].price < highs[-2].price
-            ll = lows[-1].price  < lows[-2].price
-            if hh and hl: return "BULLISH"
-            if lh and ll: return "BEARISH"
-            return "NO_TRADE"
-        d1_b = simple_trend(d1_highs, d1_lows)
-        h4_b = simple_trend(h4_highs, h4_lows)
-        if d1_b == bias: htf += 2
-        if h4_b == bias: htf += 2
-        if w1 and (bias == "BULLISH" and w1[-1].close > w1[-1].open) or \
-                  (bias == "BEARISH" and w1[-1].close < w1[-1].open): htf += 1
+    if d1_bias == bias: htf += 2
+    if h4_bias == bias: htf += 2
+    if w1 and (bias == "BULLISH" and w1[-1].close > w1[-1].open) or \
+              (bias == "BEARISH" and w1[-1].close < w1[-1].open): htf += 1
 
     # Dim 2: Entry Confluence
-    entry_score = 0
-    if swept:         entry_score += 2
-    if primary_fvg:   entry_score += 1
-    if primary_fvg and primary_fvg.timeframe in {"H4", "D1", "W1"}:
-        entry_score += 1
+    entry = 0
+
+    # Sweep bonus only
+    if swept:
+     entry += 2
+
+# Relaxed FVG proximity
+    if primary_fvg is not None:
+     entry += 1
+
+# HTF FVG bonus
+    if primary_fvg is not None and primary_fvg.timeframe in {"H4", "D1", "W1"}:
+     entry += 1
 
     # Dim 3: Session Quality
     hour = candle.opened_ny.hour
     session = 0
-    if 2 <= hour < 5:     session = 2
-    elif 8 <= hour <= 11: session = 3
-    elif 5 <= hour < 8:   session = 1
+    if 2 <= hour < 5:  session = 2   # London open
+    elif 8 <= hour <= 11: session = 3  # London-NY overlap
+    elif 5 <= hour < 8:  session = 1   # NY morning
 
     # Dim 4: Risk Quality
     risk_score = 0
-    if rr >= 3.0:      risk_score += 3
-    elif rr >= 2.5:    risk_score += 2
-    elif rr >= MIN_RR: risk_score += 1
-    sl_price_calc = entry_price - sl_pips if bias == "BULLISH" else entry_price + sl_pips
-    _, lows_c  = detect_swings(h1[-50:])
-    highs_c, _ = detect_swings(h1[-50:])
-    sl_aligned = False
-    if bias == "BULLISH":
-        sl_aligned = any(abs(sw.price - sl_price_calc) <= 3.0 for sw in lows_c)
-    else:
-        sl_aligned = any(abs(sw.price - sl_price_calc) <= 3.0 for sw in highs_c)
-    if sl_aligned:
-        risk_score += 1
+    if sl_pips <= 25:    risk_score += 2
+    elif sl_pips <= 30:  risk_score += 1
+    if rr >= 2.5:        risk_score += 2
+    elif rr >= MIN_RR:   risk_score += 1
 
-    total = htf + entry_score + session + risk_score
+    total = htf + entry + session + risk_score
 
+    # Grade
     if total >= 14:   grade = "A+"
     elif total >= 11: grade = "A"
     elif total >= 8:  grade = "B"
     elif total >= 5:  grade = "C"
     else:             grade = "WEAK"
 
-    return htf, entry_score, session, risk_score, total, grade
+    return htf, entry, session, risk_score, total, grade
 
 
-# ── Open filter / weekly-daily open bonus ────────────────────────────────────
+# ── Open filter ───────────────────────────────────────────────────────────────
 
-def weekly_daily_open_bonus(
+def open_filter_score(
     bias: str,
-    entry_price: float,
+    entry: float,
     w1: list[Candle],
     d1: list[Candle],
 ) -> int:
-    score = 0
-    if w1:
-        weekly_open = w1[-1].open
-        if bias == "BULLISH" and entry_price < weekly_open:
-            score += 1
-        elif bias == "BEARISH" and entry_price > weekly_open:
-            score += 1
-    if d1:
-        daily_open = d1[-1].open
-        if bias == "BULLISH" and entry_price < daily_open:
-            score += 1
-        elif bias == "BEARISH" and entry_price > daily_open:
-            score += 1
-    return score
+    """0 = no confirms, 1 = one confirms, 2 = both confirm."""
+    if not w1 or not d1:
+        return 0
+    w_ok = (entry >= w1[-1].open) if bias == "BULLISH" else (entry <= w1[-1].open)
+    d_ok = (entry >= d1[-1].open) if bias == "BULLISH" else (entry <= d1[-1].open)
+    return (1 if w_ok else 0) + (1 if d_ok else 0)
 
-
-# ── Signal finder ─────────────────────────────────────────────────────────────
 
 def find_signal(
     history: dict[str, list[Candle]],
@@ -1245,7 +889,7 @@ def find_signal(
 
     next_candle = h1_all[h1_index + 1]
 
-    # ── Rule 1: Valid day and session ─────────────────────────────────────
+    # ── Rule 1: Valid day and session (NY time) ───────────────────────────
     time_ok, _ = is_valid_trading_time(candle, next_candle)
     if not time_ok:
         return None
@@ -1262,30 +906,30 @@ def find_signal(
 
     # ── Rule 2: News filter ───────────────────────────────────────────────
     cpi_this_week = get_cpi_this_week(candle.opened_at, news_events)
-    news_blocked, _ = is_news_blocked(candle.opened_at, news_events, cpi_this_week)
+    news_blocked, news_reason = is_news_blocked(
+        candle.opened_at, news_events, cpi_this_week
+    )
     if news_blocked:
         return None
 
-    # ── Rule 3: Bias (new 4-variable engine) ──────────────────────────────
-    current_price = candle.close
-    bias_result   = calculate_bias(d1, h4, w1, current_price, as_of)
-    bias          = bias_result.final_bias
-
+    # ── Rule 3: Weekly bias from D1 / H4 ─────────────────────────────────
+    bias = technical_bias(d1, h4)
     if bias not in {"BULLISH", "BEARISH"}:
         return None
 
-    # Require at least MEDIUM conviction to trade
-    if bias_result.conviction not in {"HIGH", "MEDIUM"}:
-        return None
-
     # ── Layer 1: HTF area of interest ────────────────────────────────────
+    # This gives us the macro zone — NOT the entry
     htf_area = choose_htf_area(history, fvg_cache, as_of, bias)
+    # HTF area is preferred but not required
+    # If no HTF FVG exists we still look for H1 entries in bias direction
 
     # ── Layer 2: H1/H4 entry FVG ─────────────────────────────────────────
+    # Hard rule from rules.docx: price MUST be inside the FVG
     entry_price = next_candle.open
+    current_price = candle.close
 
     entry_fvg = find_entry_fvg(
-        history, fvg_cache, as_of, bias, current_price, htf_area, h1, h4
+        history, fvg_cache, as_of, bias, current_price, htf_area
     )
     if entry_fvg is None:
         return None
@@ -1294,45 +938,53 @@ def find_signal(
     sl_price, sl_pips = find_sl_price(bias, entry_price, h1, entry_fvg)
     if sl_price is None:
         return None
+    if not (MIN_SL_PIPS <= sl_pips <= MAX_SL_PIPS):
+        return None
 
     # ── Rule 5: Minimum 1:2 R:R ──────────────────────────────────────────
-    tp_price, rr = find_tp_price(bias, entry_price, sl_price, d1, h4, h1)
+    tp_price, rr = find_tp_price(bias, entry_price, sl_price, d1, h4)
     if tp_price is None or rr < MIN_RR:
         return None
 
+    # Direction sanity
     if bias == "BULLISH" and (tp_price <= entry_price or sl_price >= entry_price):
         return None
     if bias == "BEARISH" and (tp_price >= entry_price or sl_price <= entry_price):
         return None
 
-    # ── Sweep detection ───────────────────────────────────────────────────
-    swept, swept_level = detect_liquidity_sweep(h1, bias, d1)
+    # ── Sweep detection (optional — score bonus only) ─────────────────────
+    swept, swept_level = detect_liquidity_sweep(h1, bias)
     sweep_bonus = 2 if swept else 0
 
     # ── Confluence score ──────────────────────────────────────────────────
-    open_score     = weekly_daily_open_bonus(bias, entry_price, w1, d1)
-    entry_tf_wt    = 3 if entry_fvg.timeframe == "H4" else 2
-    htf_bonus      = 2 if htf_area is not None else 0
-    # Conviction bonus from bias engine
-    conv_bonus     = 2 if bias_result.conviction == "HIGH" else 1
-    score = open_score + entry_tf_wt + htf_bonus + sweep_bonus + conv_bonus
+    open_score = open_filter_score(bias, entry_price, w1, d1)
+    entry_tf_weight = 3 if entry_fvg.timeframe == "H4" else 2  # H4 > H1
+    htf_bonus = 2 if htf_area is not None else 0
+    score = open_score + entry_tf_weight + htf_bonus + sweep_bonus
 
+    # Grade — WEAK is the only hard rejection
     setup_quality = (
-        "A" if score >= 9 else
-        "B" if score >= 7 else
-        "C" if score >= 4 else "WEAK"
+        "A" if score >= 8 else
+        "B" if score >= 6 else
+        "C" if score >= 3 else "WEAK"
     )
     if setup_quality == "WEAK":
         return None
 
     # ── TTPS score ────────────────────────────────────────────────────────
     ttps_htf, ttps_entry, ttps_session, ttps_risk, ttps_total, ttps_grade = calculate_ttps(
-        bias=bias, swept=swept, primary_fvg=entry_fvg,
-        confluence_score=score, sl_pips=sl_pips, rr=rr,
-        candle=candle, w1=w1, d1=d1, h4=h4, h1=h1,
-        entry_price=entry_price, bias_result=bias_result,
+        bias=bias,
+        swept=swept,
+        primary_fvg=entry_fvg,
+        confluence_score=score,
+        sl_pips=sl_pips,
+        rr=rr,
+        candle=candle,
+        w1=w1, d1=d1, h4=h4, h1=h1,
+        entry_price=entry_price,
     )
 
+    # Soft rule: risk dimension must be >= 1 (not a hard kill)
     if ttps_risk < 1:
         return None
 
@@ -1356,7 +1008,6 @@ def find_signal(
         primary_fvg_top=entry_fvg.top,
         swept_level=swept_level,
         block_reason="Signal confirmed",
-        bias=bias_result,
     )
 
 
@@ -1366,21 +1017,30 @@ def simulate_exit(
     signal: Signal,
     future_h1: list[Candle],
 ) -> tuple[str, float, float | None, datetime | None]:
+    """
+    Walk forward candle by candle.
+    Uses high/low touch — NOT close price.
+    If SL and TP both touched on same candle → SL wins (conservative).
+    """
     for c in future_h1:
         if c.opened_at < signal.entry_time:
             continue
+
         if signal.direction == "BULLISH":
             sl_hit = c.low  <= signal.sl_price
             tp_hit = c.high >= signal.tp_price
         else:
             sl_hit = c.high >= signal.sl_price
             tp_hit = c.low  <= signal.tp_price
+
         if sl_hit and tp_hit:
-            return "LOSS", -1.0, signal.sl_price, c.opened_at
+            return "LOSS", -1.0, signal.sl_price, c.opened_at   # SL wins
+
         if sl_hit:
             return "LOSS", -1.0, signal.sl_price, c.opened_at
         if tp_hit:
             return "WIN", signal.rr_ratio, signal.tp_price, c.opened_at
+
     return "OPEN", 0.0, None, None
 
 
@@ -1404,13 +1064,13 @@ def run_backtest(
     fold:  str = "full",
     write_log: bool = True,
 ) -> list[Trade]:
-    symbol        = exported_symbol()
+    symbol = exported_symbol()
     start_balance = env_float("ACCOUNT_BALANCE", 100_000.0)
     risk_pct      = env_float("RISK_PER_TRADE", 0.01)
 
-    history     = {tf: load_history(tf) for tf in ("W1", "D1", "H4", "H1")}
-    fvg_cache   = build_fvg_cache(history)
-    news_csv    = PROJECT_ROOT / "data" / "news_events_sample.csv"
+    history = {tf: load_history(tf) for tf in ("W1", "D1", "H4", "H1")}
+    fvg_cache = build_fvg_cache(history)
+    news_csv  = PROJECT_ROOT / "data" / "news_events_sample.csv"
     news_events = load_news(news_csv)
 
     h1_all = history["H1"]
@@ -1429,46 +1089,61 @@ def run_backtest(
         candle = h1_all[idx]
         as_of  = candle.opened_at + TIMEFRAME_DURATIONS["H1"]
 
-        if start and candle.opened_at.date() < start.date(): continue
-        if end   and candle.opened_at.date() >= end.date():  break
+        # Date range filter
+        if start and as_of < start: continue
+        if end   and as_of >= end:  break
 
+        # ── Weekly reset (Sunday 18:00 NY) ────────────────────────────────
         wk = week_key(candle.opened_at)
         if wk != last_week:
             state.week = WeekState(start_balance=state.account_balance)
-            last_week  = wk
+            last_week = wk
 
+        # ── Monthly reset ─────────────────────────────────────────────────
         mk = month_key(candle.opened_at)
         if mk != last_month:
             state.month_start_balance = state.account_balance
-            state.monthly_kill        = False
+            state.monthly_kill = False
             last_month = mk
 
-        if check_weekly_kill(state):  state.week.kill_active = True
-        if check_monthly_kill(state): state.monthly_kill     = True
+        # ── Kill switch checks ────────────────────────────────────────────
+        if check_weekly_kill(state):
+            state.week.kill_active = True
+        if check_monthly_kill(state):
+            state.monthly_kill = True
+
         if state.week.kill_active or state.monthly_kill:
             continue
 
+        # ── Max trades per week ───────────────────────────────────────────
         if state.week.trades_used >= MAX_TRADES_WEEK:
             continue
 
-        trade_date      = candle.opened_ny.date()
-        day             = state.week.get_day(trade_date)
-        day_allowed, _  = day.may_trade()
-        if not day_allowed:
+        # ── Per-day trade permission ──────────────────────────────────────
+        # Evaluated independently each day. A loss on a previous day does
+        # NOT block trading today. Only same-day closed losses block.
+        trade_date = candle.opened_ny.date()
+        day        = state.week.get_day(trade_date)
+        day_ok, _  = day.may_open_trade()
+        if not day_ok:
             continue
 
+        # ── Find signal ───────────────────────────────────────────────────
         signal = find_signal(history, fvg_cache, idx, news_events)
         if signal is None:
             continue
 
-        risk_multiplier = state.week.risk_multiplier()
-        risk_amount     = start_balance * risk_pct
-        lot_size        = math.floor(
+        trade_day = candle.opened_ny.date()
+
+        # ── Position sizing ───────────────────────────────────────────────
+        risk_amount = state.account_balance * risk_pct
+        lot_size    = math.floor(
             risk_amount / (signal.sl_pips * XAUUSD_PIP_VALUE_LOT) * 100
         ) / 100
         if lot_size <= 0:
             continue
 
+        # ── Simulate exit ─────────────────────────────────────────────────
         future = [c for c in h1_all[idx+1:] if c.opened_at >= signal.entry_time]
         result, r_gained, close_price, close_time = simulate_exit(signal, future)
 
@@ -1479,6 +1154,7 @@ def run_backtest(
         else:
             pnl = 0.0
 
+        # ── Holding time ──────────────────────────────────────────────────
         holding_hours = 0.0
         if close_time:
             holding_hours = (close_time - signal.entry_time).total_seconds() / 3600
@@ -1511,25 +1187,30 @@ def run_backtest(
             primary_fvg_top=signal.primary_fvg_top,
             swept_level=signal.swept_level,
             risk_amount=risk_amount,
-            risk_multiplier=risk_multiplier,
             block_reason=signal.block_reason,
-            bias=signal.bias,
         )
         trades.append(trade)
 
+        # ── Update state ──────────────────────────────────────────────────
+        # Record that a trade was OPENED on this day (always)
+        day.record_open()
+        state.week.trades_used += 1
+        state.week.days_traded.add(trade_date)
+
         if result in {"WIN", "LOSS"}:
-            state.account_balance   += pnl
-            state.week.weekly_pnl   += pnl
-            state.week.trades_used  += 1
-            state.week.days_traded.add(trade_date)
-            if result == "WIN":   state.week.weekly_wins   += 1
-            else:                 state.week.weekly_losses += 1
-            day.record(result)
-            if check_weekly_kill(state):  state.week.kill_active = True
-            if check_monthly_kill(state): state.monthly_kill     = True
-        else:
-            state.week.trades_used += 1
-            state.week.days_traded.add(trade_date)
+            state.account_balance  += pnl
+            state.week.weekly_pnl  += pnl
+
+            # Record the close on the day it actually closed (NY date)
+            if close_time is not None:
+                close_date_ny = utc_to_ny(close_time).date()
+                close_day     = state.week.get_day(close_date_ny)
+                close_day.record_close(result)
+
+            if check_weekly_kill(state):
+                state.week.kill_active = True
+            if check_monthly_kill(state):
+                state.monthly_kill = True
 
     if write_log:
         equity_path  = OUTPUT_DIR / "equity_curve.csv"
@@ -1538,7 +1219,7 @@ def run_backtest(
         write_equity_curve(trades, equity_path, start_balance)
         write_metrics_json(trades, metrics_path, start_balance)
         try:
-            write_html_dashboard()
+           write_html_dashboard()
         except Exception as e:
             print(f"Dashboard generation failed: {e}")
 
@@ -1548,6 +1229,10 @@ def run_backtest(
 # ── Walk-forward ──────────────────────────────────────────────────────────────
 
 def walk_forward() -> list[dict[str, object]]:
+    """
+    4 validation folds — 6 months IS, 2 months OOS each.
+    Dates are anchored to the actual data range.
+    """
     h1 = load_history("H1")
     if not h1:
         print("No H1 data. Run: python main.py export-history")
@@ -1564,12 +1249,15 @@ def walk_forward() -> list[dict[str, object]]:
         d = min(dt.day, calendar.monthrange(y, m)[1])
         return dt.replace(year=y, month=m, day=d)
 
-    folds  = []
+    # Build folds dynamically from data range
+    folds = []
+    oos_months = 2
+    is_months  = 6
     anchor = data_start
     fold_n = 1
     while True:
-        oos_start = add_months(anchor, 6)
-        oos_end   = add_months(oos_start, 2)
+        oos_start = add_months(anchor, is_months)
+        oos_end   = add_months(oos_start, oos_months)
         if oos_end > data_end:
             break
         folds.append((
@@ -1578,21 +1266,21 @@ def walk_forward() -> list[dict[str, object]]:
             oos_start.strftime("%Y-%m-%d"),
             oos_end.strftime("%Y-%m-%d"),
         ))
-        anchor = add_months(anchor, 2)
+        anchor = add_months(anchor, oos_months)
         fold_n += 1
 
     if not folds:
-        print("Not enough data for walk-forward.")
+        print("Not enough data for walk-forward. Need at least 8 months.")
         return []
 
     rows: list[dict[str, object]] = []
-    all_oos: list[Trade] = []
+    all_oos_trades: list[Trade] = []
 
     for fold, train_start, val_start, val_end in folds:
-        s      = parse_date(val_start)
-        e      = parse_date(val_end)
+        s = parse_date(val_start)
+        e = parse_date(val_end)
         trades = run_backtest(s, e, fold=fold, write_log=False)
-        all_oos.extend(trades)
+        all_oos_trades.extend(trades)
         m = calculate_metrics(trades)
         rows.append({
             "fold": fold,
@@ -1602,11 +1290,10 @@ def walk_forward() -> list[dict[str, object]]:
             **metrics_to_row(m),
         })
 
-    write_trades(TRADE_LOG_PATH, all_oos)
+    write_trades(TRADE_LOG_PATH, all_oos_trades)
     write_dicts(FOLD_LOG_PATH, rows)
-    sb = env_float("ACCOUNT_BALANCE", 100_000.0)
-    write_equity_curve(all_oos, OUTPUT_DIR / "equity_curve.csv", sb)
-    write_metrics_json(all_oos, OUTPUT_DIR / "metrics.json", sb)
+    write_equity_curve(all_oos_trades, OUTPUT_DIR / "equity_curve.csv", env_float("ACCOUNT_BALANCE", 100_000.0))
+    write_metrics_json(all_oos_trades, OUTPUT_DIR / "metrics.json", env_float("ACCOUNT_BALANCE", 100_000.0))
     return rows
 
 
@@ -1616,19 +1303,19 @@ def calculate_metrics(
     trades: list[Trade],
     starting_balance: float | None = None,
 ) -> Metrics:
-    sb      = env_float("ACCOUNT_BALANCE", 100_000.0) if starting_balance is None else starting_balance
-    closed  = [t for t in trades if t.result in {"WIN", "LOSS"}]
-    wins    = [t for t in closed  if t.result == "WIN"]
-    losses  = [t for t in closed  if t.result == "LOSS"]
-    gp      = sum(t.pnl for t in wins)
-    gl      = abs(sum(t.pnl for t in losses))
-    total_r = sum(t.r_gained for t in closed)
-    wr      = len(wins) / len(closed) * 100.0 if closed else 0.0
-    pf      = gp / gl if gl else (math.inf if gp else 0.0)
+    sb = env_float("ACCOUNT_BALANCE", 100_000.0) if starting_balance is None else starting_balance
+    closed   = [t for t in trades if t.result in {"WIN", "LOSS"}]
+    wins     = [t for t in closed  if t.result == "WIN"]
+    losses   = [t for t in closed  if t.result == "LOSS"]
+    gp       = sum(t.pnl for t in wins)
+    gl       = abs(sum(t.pnl for t in losses))
+    total_r  = sum(t.r_gained for t in closed)
+    wr       = len(wins) / len(closed) * 100.0 if closed else 0.0
+    pf       = gp / gl if gl else (math.inf if gp else 0.0)
 
-    balance = sb
-    peak    = sb
-    max_dd  = 0.0
+    balance  = sb
+    peak     = sb
+    max_dd   = 0.0
     returns: list[float] = []
     for t in closed:
         before   = balance
@@ -1640,18 +1327,22 @@ def calculate_metrics(
 
     sharpe = 0.0
     if len(returns) > 1:
-        mean   = sum(returns) / len(returns)
-        var    = sum((x - mean) ** 2 for x in returns) / (len(returns) - 1)
-        std    = math.sqrt(var)
+        mean = sum(returns) / len(returns)
+        var  = sum((x - mean) ** 2 for x in returns) / (len(returns) - 1)
+        std  = math.sqrt(var)
         sharpe = mean / std * math.sqrt(len(returns)) if std else 0.0
 
     return Metrics(
-        trades=len(trades), closed=len(closed),
-        wins=len(wins), losses=len(losses),
-        win_rate=wr, profit_factor=pf,
+        trades=len(trades),
+        closed=len(closed),
+        wins=len(wins),
+        losses=len(losses),
+        win_rate=wr,
+        profit_factor=pf,
         total_r=total_r,
         average_r=total_r / len(closed) if closed else 0.0,
-        max_drawdown_pct=max_dd, sharpe=sharpe,
+        max_drawdown_pct=max_dd,
+        sharpe=sharpe,
         final_balance=balance,
     )
 
@@ -1665,25 +1356,22 @@ def monte_carlo(r_values: list[float], runs: int = 1000) -> dict[str, float]:
         random.shuffle(shuffled)
         eq, peak, max_dd = 0.0, 0.0, 0.0
         for r in shuffled:
-            eq    += r
-            peak   = max(peak, eq)
+            eq   += r
+            peak  = max(peak, eq)
             max_dd = max(max_dd, peak - eq)
         dds.append(max_dd)
     dds.sort()
     return {
-        "runs":              float(runs),
-        "worst_drawdown_r":  dds[-1],
-        "median_drawdown_r": dds[len(dds) // 2],
+        "runs":               float(runs),
+        "worst_drawdown_r":   dds[-1],
+        "median_drawdown_r":  dds[len(dds) // 2],
     }
 
 
 # ── Writers ───────────────────────────────────────────────────────────────────
 
-def write_equity_curve(
-    trades: list[Trade],
-    path: Path,
-    start_balance: float,
-) -> None:
+def write_equity_curve(trades: list[Trade], path: Path, start_balance: float) -> None:
+    """Write equity_curve.csv so the dashboard can draw an accurate chart."""
     path.parent.mkdir(parents=True, exist_ok=True)
     balance = start_balance
     rows = [{"timestamp": "Start", "balance": round(balance, 2)}]
@@ -1700,12 +1388,9 @@ def write_equity_curve(
         w.writerows(rows)
 
 
-def write_metrics_json(
-    trades: list[Trade],
-    path: Path,
-    start_balance: float,
-) -> None:
-    m      = calculate_metrics(trades, start_balance)
+def write_metrics_json(trades: list[Trade], path: Path, start_balance: float) -> None:
+    """Write metrics.json so the dashboard gets accurate summary stats."""
+    m = calculate_metrics(trades, start_balance)
     closed = [t for t in trades if t.result in {"WIN", "LOSS"}]
     weekly_r: dict[str, float] = {}
     for t in closed:
@@ -1728,8 +1413,7 @@ def write_metrics_json(
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
+    
 def write_trades(path: Path, trades: list[Trade]) -> None:
     write_dicts(path, [trade_to_row(t) for t in trades], TRADE_FIELDS)
 
@@ -1752,7 +1436,6 @@ def write_dicts(
 
 def trade_to_row(t: Trade) -> dict[str, object]:
     ny_entry = utc_to_ny(t.entry_time_utc)
-    b = t.bias
     return {
         "trade_id":          t.trade_id,
         "instrument":        t.instrument,
@@ -1787,17 +1470,8 @@ def trade_to_row(t: Trade) -> dict[str, object]:
         "primary_fvg_top":   f"{t.primary_fvg_top:.2f}",
         "swept_level":       f"{t.swept_level:.2f}" if t.swept_level else "",
         "risk_amount":       f"{t.risk_amount:.2f}",
-        "risk_multiplier":   f"{t.risk_multiplier:.1f}",
         "week_number":       week_key(t.entry_time_utc),
         "block_reason":      t.block_reason,
-        # Bias engine columns
-        "bias_trend_score":  f"{b.trend_bull}/{b.trend_bear}" if b else "",
-        "bias_swing_score":  f"{b.swing_bull}/{b.swing_bear}" if b else "",
-        "bias_zone_score":   f"{b.zone_bull}/{b.zone_bear}"   if b else "",
-        "bias_po3_score":    f"{b.po3_bull}/{b.po3_bear}"     if b else "",
-        "bias_bull_total":   b.bull_total if b else "",
-        "bias_bear_total":   b.bear_total if b else "",
-        "bias_conviction":   b.conviction if b else "",
     }
 
 
@@ -1841,8 +1515,9 @@ def print_data_status() -> None:
     print(f"Symbol: {exported_symbol()}")
     for tf, candles in history.items():
         if candles:
-            print(f"  {tf}: {len(candles)} candles  "
-                  f"{format_ny(candles[0].opened_at)} → {format_ny(candles[-1].opened_at)} (NY)")
+            first_ny = format_ny(candles[0].opened_at)
+            last_ny  = format_ny(candles[-1].opened_at)
+            print(f"  {tf}: {len(candles)} candles  {first_ny} → {last_ny} (NY)")
         else:
             print(f"  {tf}: MISSING")
 
@@ -1876,8 +1551,8 @@ def exported_symbol() -> str:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Sniper strategy backtester")
     p.add_argument("--mode", choices=("full", "walk-forward", "status"), default="full")
-    p.add_argument("--start", help="Start date e.g. 2023-01-01")
-    p.add_argument("--end",   help="End date e.g. 2025-01-01")
+    p.add_argument("--start", help="UTC start date e.g. 2023-01-01")
+    p.add_argument("--end",   help="UTC end date e.g. 2025-01-01")
     return p
 
 
@@ -1908,8 +1583,8 @@ def main() -> int:
         print(f"  Fold summary: {FOLD_LOG_PATH}")
         return 0
 
-    start  = parse_date(args.start) if args.start else None
-    end    = parse_date(args.end)   if args.end   else None
+    start = parse_date(args.start) if args.start else None
+    end   = parse_date(args.end)   if args.end   else None
     trades = run_backtest(start, end)
     print_metrics("Full Backtest", trades)
     print(f"\n  Trade log: {TRADE_LOG_PATH}")
